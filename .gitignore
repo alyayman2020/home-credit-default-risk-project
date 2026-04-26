@@ -1,0 +1,81 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ─── uv / venv ────────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+# Keep uv.lock committed for reproducibility (do NOT ignore).
+
+# ─── Environment ──────────────────────────────────────────────────────────────
+.env
+.env.local
+*.env
+!.env.example
+
+# ─── Jupyter ──────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ─── IDE ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Project: data is huge, never commit ──────────────────────────────────────
+data/raw/*
+!data/raw/.gitkeep
+data/features/*
+!data/features/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# ─── Project: artifacts are reproducible, do not commit ───────────────────────
+artifacts/models/*
+!artifacts/models/.gitkeep
+artifacts/predictions/*
+!artifacts/predictions/.gitkeep
+artifacts/*.csv
+artifacts/*.log
+
+# ─── Project: submissions log kept, files ignored ─────────────────────────────
+submissions/*.csv
+!submissions/log.csv
+!submissions/.gitkeep
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+.cache/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+coverage.xml
+*.cover
