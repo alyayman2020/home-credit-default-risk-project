@@ -51,6 +51,10 @@ def build_base_frame() -> pl.DataFrame:
     test = read_processed("application_test").with_columns(
         pl.lit(None).cast(pl.Int8).alias(config.TARGET_COL)
     )
+    # Reorder test columns to match train's schema exactly.
+    # `with_columns` appends TARGET to the end, but train has it after SK_ID_CURR.
+    # `vertical_relaxed` allows dtype mismatches but NOT column-order mismatches.
+    test = test.select(train.columns)
     base = pl.concat([train, test], how="vertical_relaxed")
     logger.info(f"  base frame: {base.height} rows × {base.width} cols")
     return base
