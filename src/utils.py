@@ -114,7 +114,7 @@ def reduce_mem_usage(df: pd.DataFrame, *, verbose: bool = True) -> pd.DataFrame:
 
     for col in df.columns:
         col_type = df[col].dtype
-        if col_type == object or pd.api.types.is_categorical_dtype(col_type):
+        if col_type == object or isinstance(col_type, pd.CategoricalDtype):
             continue
 
         c_min = df[col].min()
