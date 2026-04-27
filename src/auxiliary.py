@@ -155,7 +155,15 @@ def _train_row_level(
     pdf_curr = pdf.groupby(config.ID_COL).agg(**agg_cols).reset_index()  # type: ignore[arg-type]
 
     if months_col is not None and months_col in pdf.columns:
-        recent = pdf[pdf[months_col] >= -3]
+        # Detect whether this is a DAYS_* column (negative integers, ~ -1 to -3000)
+        # or a MONTHS_BALANCE column (negative ints, ~ -1 to -96).
+        # Last-3-months threshold: -90 days OR -3 months.
+        col_min = pdf[months_col].min()
+        if col_min is not None and col_min < -100:
+            threshold = -90  # DAYS_*
+        else:
+            threshold = -3  # MONTHS_BALANCE
+        recent = pdf[pdf[months_col] >= threshold]
         last3 = (
             recent.groupby(config.ID_COL)["_oof"]
             .mean()
@@ -197,14 +205,48 @@ def gate_check() -> bool:
     Check whether the gating threshold is met by inspecting the latest 3-GBM
     ensemble result.
 
-    TODO: read from artifacts/ensemble_log.csv. For now, returns True so the
-    pipeline can dry-run; flip to a real check before production runs.
+    Reads ``artifacts/ensemble_log.csv`` (written by ``src/ensemble.py``) and
+    compares the latest row's ``oof_auc`` to ``GATE_OOF_AUC`` (0.792 per PLAN §4.5).
+
+    Returns
+    -------
+    bool
+        True if latest ensemble OOF AUC ≥ GATE_OOF_AUC, False otherwise.
+        Returns False if the log doesn't exist (auxiliary phase shouldn't run
+        before the 3-GBM ensemble has been logged).
     """
-    logger.warning(
-        f"  gate_check: TODO — should read latest 3-GBM OOF and compare to {GATE_OOF_AUC}. "
-        "Returning True so the dry-run proceeds."
-    )
-    return True
+    log_path = config.ARTIFACTS_DIR / "ensemble_log.csv"
+    if not log_path.exists():
+        logger.warning(
+            f"  gate_check: no ensemble log at {log_path}. "
+            "Run `python -m src.ensemble` first. Gate FAILED."
+        )
+        return False
+
+    try:
+        import pandas as pd
+        log_df = pd.read_csv(log_path)
+    except Exception as e:
+        logger.error(f"  gate_check: could not read {log_path}: {e}. Gate FAILED.")
+        return False
+
+    if log_df.empty or "oof_auc" not in log_df.columns:
+        logger.warning(f"  gate_check: empty or malformed log at {log_path}. Gate FAILED.")
+        return False
+
+    latest_auc = float(log_df.iloc[-1]["oof_auc"])
+    passed = latest_auc >= GATE_OOF_AUC
+    if passed:
+        logger.success(
+            f"  gate_check: PASSED — latest 3-GBM ensemble OOF = {latest_auc:.5f} "
+            f"≥ {GATE_OOF_AUC:.3f}. Auxiliary phase will run."
+        )
+    else:
+        logger.warning(
+            f"  gate_check: FAILED — latest 3-GBM ensemble OOF = {latest_auc:.5f} "
+            f"< {GATE_OOF_AUC:.3f}. Auxiliary phase skipped (use --skip-gate to force)."
+        )
+    return passed
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
