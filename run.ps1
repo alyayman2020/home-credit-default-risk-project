@@ -1,18 +1,23 @@
-﻿# ──────────────────────────────────────────────────────────────────────────────
-# Home Credit Default Risk — PowerShell pipeline runner
-# Windows replacement for the Unix Makefile.
+# ──────────────────────────────────────────────────────────────────────────────
+# Home Credit Default Risk — PowerShell pipeline runner (Windows replacement
+# for the Unix Makefile).
 #
-# Usage (PowerShell, from project root):
-#   .\run.ps1 help
-#   .\run.ps1 install
-#   .\run.ps1 data
-#   .\run.ps1 features
-#   .\run.ps1 baseline-lgbm
-#   .\run.ps1 all
+# Why this exists: `make` is not installed on Windows by default, so commands
+# like `make features` fail. This script provides the same targets as the
+# Makefile but in a way PowerShell understands.
 #
-# If you get a "running scripts is disabled" error, run this once in an
-# elevated PowerShell session:
-#   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+# First-time setup (run ONCE in PowerShell, can be from any folder):
+#     Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+# (PowerShell will ask "Yes to All?" — answer Y. This lets you run unsigned
+# local scripts but still blocks scripts downloaded from the internet.)
+#
+# Then from the project root:
+#     .\run.ps1 help
+#     .\run.ps1 install
+#     .\run.ps1 data
+#     .\run.ps1 features
+#     .\run.ps1 baseline-lgbm
+#     .\run.ps1 all
 # ──────────────────────────────────────────────────────────────────────────────
 
 param(
@@ -22,12 +27,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# Use `uv run python` to match the Makefile. Falls back to plain `python` if
-# uv is not on PATH (a warning is printed in that case).
+# Use `uv run python` to match the Makefile workflow.
 $Python = "uv run python"
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
-    Write-Warning "uv not found on PATH — falling back to plain 'python'. Install uv from https://astral.sh/uv for reproducible runs."
-    $Python = "python"
+    Write-Warning "uv not found on PATH. Install from https://astral.sh/uv first:"
+    Write-Warning '  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"'
+    exit 1
 }
 
 function Invoke-Step {
@@ -58,25 +63,28 @@ function Show-Help {
     Write-Host "  test           Run pytest"
     Write-Host "  smoke          Run leakage smoke tests"
     Write-Host ""
-    Write-Host "Pipeline (PLAN_v2.md `S9):"
-    Write-Host "  data           Load + sentinel-replace + write parquet"
-    Write-Host "  features       Build all 3 feature matrices"
-    Write-Host "  baseline       All baselines: LGBM + XGB + CatBoost + NN-A"
-    Write-Host "  baseline-lgbm  LGBM baseline only"
-    Write-Host "  baseline-xgb   XGBoost baseline only"
-    Write-Host "  baseline-cat   CatBoost baseline only"
-    Write-Host "  baseline-nn    NN-A baseline only"
-    Write-Host "  tune           Optuna sweeps (~6.7 hr)"
+    Write-Host "Pipeline (in order):"
+    Write-Host "  data           Load CSVs -> processed parquet (~30 sec)"
+    Write-Host "  folds          Build CV folds (~3 sec)"
+    Write-Host "  features       Build all 3 feature matrices (~2 min)"
+    Write-Host "  baseline-lgbm  LGBM baseline (~30 min on GPU, ~60 min CPU)"
+    Write-Host "  baseline-xgb   XGBoost baseline"
+    Write-Host "  baseline-cat   CatBoost baseline"
+    Write-Host "  baseline-nn    NN-A baseline"
+    Write-Host "  baseline       All four baselines in sequence"
+    Write-Host "  tune           Optuna sweeps (~6.7 hr — overnight)"
     Write-Host "  train          Refit tuned models on 5 folds"
     Write-Host "  ensemble       Dirichlet + Nelder-Mead blend"
     Write-Host "  submit         Write submission CSV"
-    Write-Host "  all            data -> features -> baseline -> tune -> train -> ensemble -> submit"
+    Write-Host "  all            data -> folds -> features -> baseline -> tune -> train -> ensemble -> submit"
     Write-Host ""
     Write-Host "Cleanup:"
     Write-Host "  clean          Remove __pycache__, .pytest_cache, .ruff_cache"
     Write-Host ""
     Write-Host "Examples:"
     Write-Host "  .\run.ps1 data"
+    Write-Host "  .\run.ps1 folds"
+    Write-Host "  .\run.ps1 features"
     Write-Host "  .\run.ps1 baseline-lgbm"
     Write-Host ""
 }
@@ -87,8 +95,8 @@ switch ($Target) {
     # ─── Setup ───────────────────────────────────────────────────────────
     "install"       { Invoke-Step "Install (CPU torch)" "uv sync --extra dev" }
     "install-gpu"   {
-        Invoke-Step "Install (deps)" "uv sync --extra dev"
-        Invoke-Step "Install GPU torch (CUDA 12.1)" "uv pip install torch --index-url https://download.pytorch.org/whl/cu121"
+        Invoke-Step "Install dependencies"            "uv sync --extra dev"
+        Invoke-Step "Install GPU torch (CUDA 12.1)"   "uv pip install torch --index-url https://download.pytorch.org/whl/cu121"
     }
     "lock"          { Invoke-Step "Refresh uv.lock" "uv lock" }
 
@@ -105,11 +113,12 @@ switch ($Target) {
     "test"          { Invoke-Step "pytest" "uv run pytest" }
     "smoke"         {
         Invoke-Step "CV smoke" "$Python -m src.cv --smoke"
-        Write-Host "→ Run notebooks/04_eda_target_leakage_check.ipynb for the full leakage suite."
+        Write-Host "-> Run notebooks/04_eda_target_leakage_check.ipynb for full leakage suite."
     }
 
     # ─── Pipeline ────────────────────────────────────────────────────────
     "data"          { Invoke-Step "Load raw CSVs -> processed parquet" "$Python -m src.data" }
+    "folds"         { Invoke-Step "Build CV folds"                      "$Python -m src.cv" }
     "features"      { Invoke-Step "Assemble feature matrices"           "$Python -m src.features.assemble" }
 
     "baseline-lgbm" { Invoke-Step "LGBM baseline"     "$Python -m src.train --model lgbm --mode baseline" }
@@ -117,10 +126,10 @@ switch ($Target) {
     "baseline-cat"  { Invoke-Step "CatBoost baseline" "$Python -m src.train --model catboost --mode baseline" }
     "baseline-nn"   { Invoke-Step "NN-A baseline"     "$Python -m src.train --model nn_a --mode baseline" }
     "baseline"      {
-        Invoke-Step "LGBM baseline"     "$Python -m src.train --model lgbm --mode baseline"
-        Invoke-Step "XGBoost baseline"  "$Python -m src.train --model xgb --mode baseline"
-        Invoke-Step "CatBoost baseline" "$Python -m src.train --model catboost --mode baseline"
-        Invoke-Step "NN-A baseline"     "$Python -m src.train --model nn_a --mode baseline"
+        & $PSCommandPath baseline-lgbm
+        & $PSCommandPath baseline-xgb
+        & $PSCommandPath baseline-cat
+        & $PSCommandPath baseline-nn
     }
 
     "tune"          {
@@ -142,6 +151,7 @@ switch ($Target) {
 
     "all"           {
         & $PSCommandPath data
+        & $PSCommandPath folds
         & $PSCommandPath features
         & $PSCommandPath baseline
         & $PSCommandPath tune

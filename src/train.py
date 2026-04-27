@@ -10,9 +10,8 @@ What this file owns
    for auxiliary models via ``--group``).
 3. **Inside the fold loop, on a per-fold basis**:
    a. Compute OOF target encoding (smoothed) for high-cardinality cats.
-   b. 🆕 D1: Build a NearestNeighbors index on `train[fold != k]`, query
-      `train[fold == k]` to get TARGET_NEIGHBORS_500_MEAN. For test, build
-      a full-train index and query test.
+   b. 🆕 D1: Build a NearestNeighbors index on the 4 D1 features only
+      (EXT_SOURCE_1/2/3 + APP_CREDIT_TERM) of the train fold. Query valid + test.
    c. 🆕 D2: Fit RankGauss (QuantileTransformer) on train fold only when
       using the NN matrix; transform train+valid inside the fold.
 4. Call ``model.fit_fold(...)`` and persist artifacts.
@@ -28,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -58,6 +56,10 @@ NEIGHBOR_FEATURE_COLS: list[str] = [
 ]
 NEIGHBOR_K: int = 500
 
+# Suffix used for nan-flag columns produced by features.assemble.to_nn_matrix.
+# Must match what's written there.
+NAN_FLAG_SUFFIX: str = "__isnan"
+
 
 # ─── Model registry ───────────────────────────────────────────────────────────
 
@@ -66,23 +68,18 @@ def get_model(name: str, params: dict[str, Any] | None = None) -> ModelBase:
     """Return a fresh model instance by name."""
     if name == "lgbm":
         from src.models.lgbm import LGBMModel
-
         return LGBMModel(params)
     if name == "xgb":
         from src.models.xgb import XGBModel
-
         return XGBModel(params)
     if name == "catboost":
         from src.models.catboost import CatBoostModel
-
         return CatBoostModel(params)
     if name == "nn_a":
         from src.models.nn import NNAModel
-
         return NNAModel(params)
     if name == "nn_b":
         from src.models.nn import NNBModel
-
         return NNBModel(params)
     raise ValueError(f"Unknown model: {name!r}")
 
@@ -95,9 +92,18 @@ def load_feature_matrix(matrix: str) -> pl.DataFrame:
     spec = config.FEATURE_MATRICES[matrix]
     if not spec.parquet_path.exists():
         raise FileNotFoundError(
-            f"Feature matrix {spec.parquet_path} missing — run `make features` first."
+            f"Feature matrix {spec.parquet_path} missing — run "
+            f"`uv run python -m src.features.assemble` first."
         )
     return pl.read_parquet(spec.parquet_path)
+
+
+def load_catboost_cat_features() -> list[str]:
+    """Read the catboost cat-feature sidecar written by assemble.to_catboost_matrix."""
+    path = config.FEATURES_DIR / "cat_features.json"
+    if not path.exists():
+        return []
+    return json.loads(path.read_text())
 
 
 def split_train_test(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
@@ -128,7 +134,8 @@ def oof_target_encode(
     in valid/test. Target encoding is fit on X_tr only — never on X_va/X_test —
     so per-fold values differ across folds (verifiable via notebook 04).
 
-    Adds ``{col}_TE`` columns to X_tr, X_va, X_test in place (returns copies).
+    Adds ``{col}_TE`` columns to X_tr, X_va, X_test (returns copies).
+    Handles both string and pandas ``category`` dtype source columns.
     """
     X_tr = X_tr.copy()
     X_va = X_va.copy()
@@ -138,16 +145,21 @@ def oof_target_encode(
     for col in cat_cols:
         if col not in X_tr.columns:
             continue
-        # Compute smoothed encoding per category using train fold ONLY.
-        df_tr = pd.DataFrame({col: X_tr[col].values, "_y": y_tr})
-        agg = df_tr.groupby(col)["_y"].agg(["sum", "count"])
+        # Cast to plain string to make ``map`` / ``groupby`` agnostic to dtype.
+        # (Avoids edge cases where ``category`` dtype on test has extra/missing levels.)
+        tr_vals = X_tr[col].astype("object")
+        va_vals = X_va[col].astype("object")
+        te_vals = X_test[col].astype("object")
+
+        df_tr = pd.DataFrame({col: tr_vals.values, "_y": y_tr})
+        agg = df_tr.groupby(col, dropna=False)["_y"].agg(["sum", "count"])
         agg["enc"] = (agg["sum"] + smoothing * global_mean) / (agg["count"] + smoothing)
         mapping = agg["enc"].to_dict()
 
         new_col = f"{col}_TE"
-        X_tr[new_col] = X_tr[col].map(mapping).astype(float).fillna(global_mean)
-        X_va[new_col] = X_va[col].map(mapping).astype(float).fillna(global_mean)
-        X_test[new_col] = X_test[col].map(mapping).astype(float).fillna(global_mean)
+        X_tr[new_col] = tr_vals.map(mapping).astype(float).fillna(global_mean).values
+        X_va[new_col] = va_vals.map(mapping).astype(float).fillna(global_mean).values
+        X_test[new_col] = te_vals.map(mapping).astype(float).fillna(global_mean).values
 
     return X_tr, X_va, X_test
 
@@ -163,37 +175,30 @@ def compute_d1_neighbours(
     """
     🆕 D1: TARGET_NEIGHBORS_500_MEAN computed via fold-aware NearestNeighbors.
 
-    For the validation rows in the current fold, the index is built only on
-    the *training* rows of that fold — so the same row gets a different
-    neighbour-mean across the 5 folds (verified by notebook 04).
+    Builds the index on the *training* rows of the current fold using ONLY the
+    4 D1 features (EXT_SOURCE_1/2/3 + APP_CREDIT_TERM). Queries are made against
+    the same 4-column subset.
 
-    For test rows: the index is built on the *full* training fold (X_tr),
-    not on all train data. This means the test value depends on which fold
-    we're in — we average across folds in run_oof().
-
-    Parameters
-    ----------
-    X_tr / X_va / X_test
-        DataFrames containing at least ``feature_cols``. NaN values are filled
-        with the train-fold median before fitting the index.
-
-    Returns
-    -------
-    (tr_neigh, va_neigh, test_neigh)
-        Three Series of length len(X_tr) / len(X_va) / len(X_test) holding
-        the neighbour TARGET mean for each row.
+    For X_va: same 4 cols, distinct rows → genuine OOF neighbour mean.
+    For X_test: same 4 cols, full test set.
+    For X_tr (the training rows themselves): we use the k-nearest including self
+    (acceptable bias at k=500 — see PLAN §2.10).
     """
     cols_present = [c for c in feature_cols if c in X_tr.columns]
     if len(cols_present) < 2:
-        # Not enough features → degrade gracefully to global mean.
+        # Not enough D1 features available → degrade gracefully to global mean.
         gm = float(y_tr.mean())
+        logger.warning(
+            f"  D1: only {len(cols_present)} of {len(feature_cols)} neighbour "
+            f"features present — falling back to global mean"
+        )
         return (
             pd.Series(np.full(len(X_tr), gm), index=X_tr.index),
             pd.Series(np.full(len(X_va), gm), index=X_va.index),
             pd.Series(np.full(len(X_test), gm), index=X_test.index),
         )
 
-    # Median imputation fit on train fold.
+    # Median imputation fit on train fold only.
     medians = X_tr[cols_present].median()
     A = X_tr[cols_present].fillna(medians).to_numpy(dtype=np.float32)
     B = X_va[cols_present].fillna(medians).to_numpy(dtype=np.float32)
@@ -203,11 +208,6 @@ def compute_d1_neighbours(
     nn = NearestNeighbors(n_neighbors=k_eff, algorithm="auto", n_jobs=-1)
     nn.fit(A)
 
-    # For training fold rows themselves, exclude self via k+1 query then drop self.
-    # Easier path: build a separate index excluding each row → too slow. Instead,
-    # for X_tr we use leave-one-out approximation: compute mean over k neighbours
-    # including self (acceptable bias for k=500). This adds nothing to leakage
-    # because A is the SAME train fold and we're computing on it.
     _, ind_tr = nn.kneighbors(A)
     tr_neigh = y_tr[ind_tr].mean(axis=1)
 
@@ -233,9 +233,10 @@ def fit_rankgauss_per_fold(
     """
     🆕 D2: RankGauss for the NN matrix.
 
-    Fit QuantileTransformer on numeric columns of X_tr only, then transform
-    X_va and X_test. ``_is_nan`` flag columns are left alone (they're already
-    in {0,1}).
+    Fits ``QuantileTransformer(output_distribution='normal')`` on numeric columns
+    of ``X_tr`` only, then transforms ``X_va`` and ``X_test``. Columns ending in
+    :data:`NAN_FLAG_SUFFIX` (``__isnan``) are left alone — they're already in {0, 1}.
+    Integer-encoded categorical columns (suffix ``__nn``) are also left alone.
 
     Returns copies — does not mutate inputs.
     """
@@ -243,9 +244,12 @@ def fit_rankgauss_per_fold(
     X_va = X_va.copy()
     X_test = X_test.copy()
 
+    # Identify columns to RankGauss-transform: numeric, not a flag, not a label-encoded cat.
     numeric_cols = [
         c for c in X_tr.columns
-        if pd.api.types.is_numeric_dtype(X_tr[c]) and not c.endswith("_is_nan")
+        if pd.api.types.is_numeric_dtype(X_tr[c])
+        and not c.endswith(NAN_FLAG_SUFFIX)
+        and not c.endswith("__nn")
     ]
     if not numeric_cols:
         return X_tr, X_va, X_test
@@ -255,7 +259,7 @@ def fit_rankgauss_per_fold(
         output_distribution="normal",
         random_state=config.SEED,
     )
-    # Median-impute before quantile transform (qt itself doesn't tolerate NaN).
+    # Median-impute before quantile transform (qt doesn't tolerate NaN).
     medians = X_tr[numeric_cols].median()
     X_tr_filled = X_tr[numeric_cols].fillna(medians)
     X_va_filled = X_va[numeric_cols].fillna(medians)
@@ -285,7 +289,7 @@ def run_oof(
     leakage-prone steps inside the CV loop (PLAN §2.10):
 
     - OOF target encoding              — fold-aware
-    - 🆕 D1 neighbours target mean      — fold-aware NN index
+    - 🆕 D1 neighbours target mean      — fold-aware NN index on 4 cols
     - 🆕 D2 RankGauss                   — fit on train fold, transform valid+test fold
     """
     logger.info(config.summary())
@@ -301,6 +305,13 @@ def run_oof(
 
     train_pl = train_pl.join(folds, on=config.ID_COL)
 
+    # For catboost matrix, pull cat_features list from the sidecar.
+    # Caller-provided cat_features takes precedence.
+    if cat_features is None and model.matrix == "catboost":
+        cat_features = load_catboost_cat_features()
+        if cat_features:
+            logger.info(f"  catboost: loaded {len(cat_features)} cat features from sidecar")
+
     with timer("Polars → pandas"):
         train_df = train_pl.to_pandas()
         test_df = test_pl.to_pandas()
@@ -310,12 +321,17 @@ def run_oof(
     X = train_df.drop(columns=drop_cols_train)
     X_test_full = test_df.drop(columns=[config.ID_COL, config.TARGET_COL])
 
-    # Identify which high-cardinality cats are still present in this matrix.
-    cat_cols_present = [c for c in HIGH_CARD_COLS if c in X.columns]
-    if cat_cols_present and model.matrix == "main":
-        # Main matrix should NOT have raw HIGH_CARD_COLS (they're dropped in assemble.py).
-        # If they're here, log it — we'll target-encode them per-fold.
-        logger.info(f"  high-card cats present for fold-wise TE: {cat_cols_present}")
+    # Identify which high-cardinality cats are still present (for OOF target encoding).
+    # On the catboost matrix these are kept as raw cats — DON'T target-encode them
+    # (CatBoost has its own internal encoding).
+    cat_cols_for_te: list[str] = []
+    if model.matrix == "main":
+        cat_cols_for_te = [c for c in HIGH_CARD_COLS if c in X.columns]
+        if cat_cols_for_te:
+            logger.info(
+                f"  main matrix: {len(cat_cols_for_te)} high-card cats present for "
+                f"per-fold target encoding: {cat_cols_for_te}"
+            )
 
     oof = np.zeros(len(y), dtype=np.float64)
     fold_aucs: list[float] = []
@@ -335,13 +351,13 @@ def run_oof(
         X_test_f = X_test_full.copy()
 
         # ── Per-fold transform 1: OOF target encoding for high-card cats ─
-        if cat_cols_present:
+        if cat_cols_for_te:
             with timer(f"  fold {fold}: OOF target encoding"):
                 X_tr_f, X_va_f, X_test_f = oof_target_encode(
-                    X_tr_f, y_tr, X_va_f, X_test_f, cat_cols=cat_cols_present
+                    X_tr_f, y_tr, X_va_f, X_test_f, cat_cols=cat_cols_for_te
                 )
             # Drop the raw cat cols — they're string and would break the model.
-            for c in cat_cols_present:
+            for c in cat_cols_for_te:
                 if c in X_tr_f.columns:
                     X_tr_f = X_tr_f.drop(columns=[c])
                     X_va_f = X_va_f.drop(columns=[c])
@@ -358,7 +374,6 @@ def run_oof(
                 X_test_f["TARGET_NEIGHBORS_500_MEAN"] = test_n.values
 
             # Save validation-fold D1 values for the leakage smoke notebook.
-            # Indexed by SK_ID_CURR for joinability.
             d1_per_fold_debug[fold] = pd.Series(
                 va_n.values,
                 index=train_df.loc[valid_mask, config.ID_COL].values,

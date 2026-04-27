@@ -9,6 +9,13 @@ Baseline config (PLAN §4.1 step 1):
 Acceptance: OOF AUC ≥ 0.785
 
 Halt condition: if baseline LGBM < 0.78, the feature pipeline has a bug.
+
+Notes on GPU
+------------
+The default ``pip``/``uv`` wheel of LightGBM on Windows is CPU-only. If
+``USE_GPU=1`` but the GPU build isn't available, ``fit_fold`` will catch the
+"GPU Tree Learner was not enabled" error and automatically retry on CPU,
+logging a warning.
 """
 
 from __future__ import annotations
@@ -27,6 +34,9 @@ from sklearn.metrics import roc_auc_score
 
 from src import config
 from src.models.base import FoldArtifacts, ModelBase
+from src.utils import get_logger
+
+logger = get_logger()
 
 
 class LGBMModel(ModelBase):
@@ -55,6 +65,49 @@ class LGBMModel(ModelBase):
             "seed": config.SEED,
         }
 
+    def _train_with_fallback(
+        self,
+        params: dict[str, Any],
+        train_set: "lgb.Dataset",
+        valid_set: "lgb.Dataset",
+    ) -> "lgb.Booster":
+        """
+        Train with the requested device. If the GPU build isn't available
+        (common on Windows pip wheels), automatically retry on CPU.
+        """
+        try:
+            return lgb.train(
+                params,
+                train_set,
+                valid_sets=[valid_set],
+                valid_names=["valid"],
+                callbacks=[
+                    lgb.early_stopping(200, verbose=False),
+                    lgb.log_evaluation(period=100),
+                ],
+            )
+        except lgb.basic.LightGBMError as e:
+            msg = str(e)
+            if "GPU" in msg or "OpenCL" in msg:
+                logger.warning(
+                    "  LightGBM GPU build not available (pip wheel is CPU-only on "
+                    "Windows). Retrying on CPU. To use GPU, install LightGBM from "
+                    "source with --gpu (see https://lightgbm.readthedocs.io)."
+                )
+                cpu_params = dict(params)
+                cpu_params["device_type"] = "cpu"
+                return lgb.train(
+                    cpu_params,
+                    train_set,
+                    valid_sets=[valid_set],
+                    valid_names=["valid"],
+                    callbacks=[
+                        lgb.early_stopping(200, verbose=False),
+                        lgb.log_evaluation(period=100),
+                    ],
+                )
+            raise
+
     def fit_fold(
         self,
         X_train: pd.DataFrame,
@@ -68,7 +121,7 @@ class LGBMModel(ModelBase):
     ) -> FoldArtifacts:
         if lgb is None:
             raise ImportError(
-                "lightgbm is not installed. `make install` or `make install-gpu` first."
+                "lightgbm is not installed. Run `uv sync --extra dev`."
             )
 
         train_set = lgb.Dataset(
@@ -85,16 +138,7 @@ class LGBMModel(ModelBase):
             free_raw_data=False,
         )
 
-        booster = lgb.train(
-            self.params,
-            train_set,
-            valid_sets=[valid_set],
-            valid_names=["valid"],
-            callbacks=[
-                lgb.early_stopping(200, verbose=False),
-                lgb.log_evaluation(period=100),
-            ],
-        )
+        booster = self._train_with_fallback(self.params, train_set, valid_set)
 
         valid_pred = booster.predict(X_valid, num_iteration=booster.best_iteration)
         test_pred = booster.predict(X_test, num_iteration=booster.best_iteration)

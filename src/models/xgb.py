@@ -7,6 +7,9 @@ Baseline config (PLAN §4.1 step 2):
     max_depth=5, learning_rate=0.02, colsample_bytree=0.3,
     tree_method='hist', device='cuda'
 Acceptance: OOF AUC ≥ 0.783
+
+If CUDA torch / xgboost isn't installed, ``fit_fold`` automatically falls back
+to ``device='cpu'`` and logs a warning.
 """
 
 from __future__ import annotations
@@ -25,6 +28,9 @@ from sklearn.metrics import roc_auc_score
 
 from src import config
 from src.models.base import FoldArtifacts, ModelBase
+from src.utils import get_logger
+
+logger = get_logger()
 
 
 class XGBModel(ModelBase):
@@ -52,6 +58,43 @@ class XGBModel(ModelBase):
             "verbosity": 1,
         }
 
+    def _fit_with_fallback(
+        self,
+        clf: "xgb.XGBClassifier",
+        X_train: pd.DataFrame,
+        y_train: np.ndarray,
+        X_valid: pd.DataFrame,
+        y_valid: np.ndarray,
+    ) -> "xgb.XGBClassifier":
+        """Fit with the requested device; fall back to CPU if CUDA unavailable."""
+        try:
+            clf.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_valid, y_valid)],
+                verbose=100,
+            )
+            return clf
+        except (xgb.core.XGBoostError, ValueError) as e:
+            msg = str(e).lower()
+            if "cuda" not in msg and "gpu" not in msg and "device" not in msg:
+                raise
+            logger.warning(
+                "  XGBoost CUDA device not available — retrying on CPU. "
+                f"Original error: {e}"
+            )
+            params = clf.get_params()
+            params["device"] = "cpu"
+            params["tree_method"] = "hist"
+            cpu_clf = xgb.XGBClassifier(**params)
+            cpu_clf.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_valid, y_valid)],
+                verbose=100,
+            )
+            return cpu_clf
+
     def fit_fold(
         self,
         X_train: pd.DataFrame,
@@ -64,7 +107,7 @@ class XGBModel(ModelBase):
         cat_features: list[str] | None = None,
     ) -> FoldArtifacts:
         if xgb is None:
-            raise ImportError("xgboost is not installed. `make install` first.")
+            raise ImportError("xgboost is not installed. Run `uv sync --extra dev`.")
 
         params = dict(self.params)
         n_estimators = params.pop("n_estimators", 5000)
@@ -76,12 +119,7 @@ class XGBModel(ModelBase):
             enable_categorical=True,
         )
 
-        clf.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_valid, y_valid)],
-            verbose=100,
-        )
+        clf = self._fit_with_fallback(clf, X_train, y_train, X_valid, y_valid)
 
         valid_pred = clf.predict_proba(X_valid)[:, 1]
         test_pred = clf.predict_proba(X_test)[:, 1]

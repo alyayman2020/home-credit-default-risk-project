@@ -32,6 +32,9 @@ from sklearn.metrics import roc_auc_score
 
 from src import config
 from src.models.base import FoldArtifacts, ModelBase
+from src.utils import get_logger
+
+logger = get_logger()
 
 
 class CatBoostModel(ModelBase):
@@ -56,14 +59,17 @@ class CatBoostModel(ModelBase):
         }
 
     @staticmethod
-    def _assert_cat_dtypes(X: pd.DataFrame, cat_features: list[str] | None) -> None:
+    def _is_categorical(series: pd.Series) -> bool:
+        """Pandas 2.2+ compatible categorical-dtype check."""
+        return isinstance(series.dtype, pd.CategoricalDtype)
+
+    def _assert_cat_dtypes(self, X: pd.DataFrame, cat_features: list[str] | None) -> None:
         """🆕 A4: assert categorical cols are ``category`` dtype, fail fast otherwise."""
         if not cat_features:
             return
         wrong = [
-            c
-            for c in cat_features
-            if c in X.columns and not pd.api.types.is_categorical_dtype(X[c].dtype)
+            c for c in cat_features
+            if c in X.columns and not self._is_categorical(X[c])
         ]
         if wrong:
             raise TypeError(
@@ -71,6 +77,49 @@ class CatBoostModel(ModelBase):
                 f"not pandas 'category' dtype. First 3: {wrong[:3]}. "
                 "Fix in features/assemble.py:to_catboost_matrix."
             )
+
+    def _normalize_cats_for_catboost(
+        self, X: pd.DataFrame, cat_features: list[str] | None
+    ) -> pd.DataFrame:
+        """
+        CatBoost requires cat columns to contain strings or integers (no NaN).
+        We convert ``category`` cols to plain object/str and replace NaN with the
+        sentinel string ``"__missing__"``.
+        """
+        if not cat_features:
+            return X
+        out = X.copy()
+        for c in cat_features:
+            if c not in out.columns:
+                continue
+            out[c] = out[c].astype("object")
+            out[c] = out[c].fillna("__missing__")
+            out[c] = out[c].astype(str)
+        return out
+
+    def _fit_with_fallback(
+        self,
+        params: dict[str, Any],
+        train_pool: "Pool",
+        valid_pool: "Pool",
+    ) -> "CatBoostClassifier":
+        """Fit with requested task_type; on GPU error, retry on CPU."""
+        try:
+            clf = CatBoostClassifier(**params)
+            clf.fit(train_pool, eval_set=valid_pool, use_best_model=True)
+            return clf
+        except Exception as e:
+            msg = str(e).lower()
+            if "gpu" not in msg and "cuda" not in msg and "device" not in msg:
+                raise
+            logger.warning(
+                f"  CatBoost GPU not available, retrying on CPU. Original error: {e}"
+            )
+            cpu_params = dict(params)
+            cpu_params["task_type"] = "CPU"
+            clf = CatBoostClassifier(**cpu_params)
+            clf.fit(train_pool, eval_set=valid_pool, use_best_model=True)
+            return clf
 
     def fit_fold(
         self,
@@ -84,17 +133,22 @@ class CatBoostModel(ModelBase):
         cat_features: list[str] | None = None,
     ) -> FoldArtifacts:
         if CatBoostClassifier is None:
-            raise ImportError("catboost is not installed. `make install` first.")
+            raise ImportError("catboost is not installed. Run `uv sync --extra dev`.")
 
+        # Assert category dtype (caught before normalization to verify upstream contract).
         self._assert_cat_dtypes(X_train, cat_features)
         self._assert_cat_dtypes(X_valid, cat_features)
         self._assert_cat_dtypes(X_test, cat_features)
 
+        # Normalize cat columns to string with sentinel for NaN.
+        X_train = self._normalize_cats_for_catboost(X_train, cat_features)
+        X_valid = self._normalize_cats_for_catboost(X_valid, cat_features)
+        X_test = self._normalize_cats_for_catboost(X_test, cat_features)
+
         train_pool = Pool(X_train, label=y_train, cat_features=cat_features)
         valid_pool = Pool(X_valid, label=y_valid, cat_features=cat_features)
 
-        clf = CatBoostClassifier(**self.params)
-        clf.fit(train_pool, eval_set=valid_pool, use_best_model=True)
+        clf = self._fit_with_fallback(self.params, train_pool, valid_pool)
 
         valid_pred = clf.predict_proba(X_valid)[:, 1]
         test_pred = clf.predict_proba(X_test)[:, 1]
