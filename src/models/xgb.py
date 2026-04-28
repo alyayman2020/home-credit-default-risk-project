@@ -8,8 +8,18 @@ Baseline config (PLAN §4.1 step 2):
     tree_method='hist', device='cuda'
 Acceptance: OOF AUC ≥ 0.783
 
-If CUDA torch / xgboost isn't installed, ``fit_fold`` automatically falls back
-to ``device='cpu'`` and logs a warning.
+Notes
+-----
+1. **Inf sanitization.** XGBoost rejects ``inf`` / ``-inf`` values by default
+   ("Input data contains `inf` or a value too large"). LightGBM tolerates them
+   silently. Some of our engineered features (CREDIT_TERM = AMT_ANNUITY/AMT_CREDIT,
+   PAYMENT_PERC = AMT_PAYMENT/AMT_INSTALMENT, etc.) can produce ``inf`` when the
+   denominator is zero. We replace ``inf``/``-inf`` with ``NaN`` before training
+   so XGBoost handles them via its ``missing`` mechanism (PLAN §1.4 sentinel
+   policy — same treatment as DAYS_EMPLOYED 365243).
+
+2. **GPU fallback.** If CUDA xgboost isn't available, ``fit_fold`` automatically
+   falls back to ``device='cpu'`` and logs a warning.
 """
 
 from __future__ import annotations
@@ -31,6 +41,33 @@ from src.models.base import FoldArtifacts, ModelBase
 from src.utils import get_logger
 
 logger = get_logger()
+
+
+def _sanitize_inf(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Replace +/-inf with NaN in numeric columns. XGBoost treats NaN as the
+    "missing" sentinel by default; inf values cause a hard error.
+
+    Returns a copy. Object/category dtype columns are left alone.
+    """
+    out = df.copy()
+    numeric_cols = out.select_dtypes(include=[np.number]).columns
+    if len(numeric_cols) == 0:
+        return out
+    # Use np.where via mask — fast, in-place on the slice.
+    mask = np.isinf(out[numeric_cols].to_numpy())
+    if mask.any():
+        n_inf = int(mask.sum())
+        logger.info(f"  xgb: replaced {n_inf} inf values with NaN before training")
+        # Apply replacement column-by-column to preserve dtypes.
+        for col in numeric_cols:
+            arr = out[col].to_numpy()
+            inf_mask = np.isinf(arr)
+            if inf_mask.any():
+                arr = arr.astype(np.float64, copy=True)
+                arr[inf_mask] = np.nan
+                out[col] = arr
+    return out
 
 
 class XGBModel(ModelBase):
@@ -108,6 +145,12 @@ class XGBModel(ModelBase):
     ) -> FoldArtifacts:
         if xgb is None:
             raise ImportError("xgboost is not installed. Run `uv sync --extra dev`.")
+
+        # Sanitize inf -> NaN. Done once on the largest frame, then we apply to all 3.
+        # Logging happens inside _sanitize_inf, only once per call.
+        X_train = _sanitize_inf(X_train)
+        X_valid = _sanitize_inf(X_valid)
+        X_test = _sanitize_inf(X_test)
 
         params = dict(self.params)
         n_estimators = params.pop("n_estimators", 5000)

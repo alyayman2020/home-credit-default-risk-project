@@ -10,16 +10,23 @@ Acceptance: OOF AUC ≥ 0.785
 
 Halt condition: if baseline LGBM < 0.78, the feature pipeline has a bug.
 
-Notes on GPU
-------------
-The default ``pip``/``uv`` wheel of LightGBM on Windows is CPU-only. If
-``USE_GPU=1`` but the GPU build isn't available, ``fit_fold`` will catch the
-"GPU Tree Learner was not enabled" error and automatically retry on CPU,
-logging a warning.
+Notes
+-----
+1. **Feature-name sanitization.** LightGBM rejects feature names that contain
+   the JSON-special characters ``,:[]{}"`` plus any whitespace. The application
+   builder produces OHE column names like ``APP_OHE_NAME_FAMILY_STATUS__Single /
+   not married`` that contain spaces and a slash. We sanitize all column names
+   in ``fit_fold`` before constructing the LightGBM ``Dataset``.
+
+2. **GPU fallback.** The default ``pip``/``uv`` wheel of LightGBM on Windows is
+   CPU-only. If ``USE_GPU=1`` but the GPU build isn't available, ``fit_fold``
+   catches the "GPU Tree Learner was not enabled" error and automatically
+   retries on CPU, logging a warning.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import numpy as np
@@ -37,6 +44,49 @@ from src.models.base import FoldArtifacts, ModelBase
 from src.utils import get_logger
 
 logger = get_logger()
+
+
+# ─── Feature-name sanitization ────────────────────────────────────────────────
+
+# Characters LightGBM rejects in feature names (the JSON-meaningful set + whitespace).
+_LGBM_FORBIDDEN_RE = re.compile(r"[\s,:\[\]\{\}\"\\/]+")
+
+
+def _sanitize_feature_names(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str]]:
+    """
+    Return a copy of ``df`` with column names rewritten so LightGBM accepts them.
+
+    Replaces any run of forbidden characters with a single underscore. If two
+    distinct source columns collapse to the same sanitized name (e.g. they
+    differ only in punctuation), appends a numeric suffix.
+
+    Returns
+    -------
+    (clean_df, mapping)
+        ``mapping`` is ``{clean_name: original_name}`` — useful if we ever
+        need to recover original names for feature-importance reports.
+    """
+    seen: dict[str, int] = {}
+    mapping: dict[str, str] = {}
+    new_cols: list[str] = []
+    for c in df.columns:
+        clean = _LGBM_FORBIDDEN_RE.sub("_", c)
+        # Collapse duplicate underscores left over after a long whitespace run.
+        clean = re.sub(r"_+", "_", clean).strip("_")
+        # If empty (all-special column name) fall back to a synthetic name.
+        if not clean:
+            clean = "feat"
+        # Disambiguate collisions.
+        if clean in seen:
+            seen[clean] += 1
+            clean = f"{clean}_{seen[clean]}"
+        else:
+            seen[clean] = 0
+        mapping[clean] = c
+        new_cols.append(clean)
+    out = df.copy()
+    out.columns = new_cols
+    return out, mapping
 
 
 class LGBMModel(ModelBase):
@@ -124,6 +174,15 @@ class LGBMModel(ModelBase):
                 "lightgbm is not installed. Run `uv sync --extra dev`."
             )
 
+        # Sanitize feature names — same mapping for train/valid/test so columns align.
+        X_train, name_map = _sanitize_feature_names(X_train)
+        X_valid.columns = X_train.columns  # safe: assemble.py guarantees identical column order
+        X_test.columns = X_train.columns
+        # Also sanitize cat_features list if any names were rewritten.
+        if cat_features:
+            inverse = {v: k for k, v in name_map.items()}
+            cat_features = [inverse.get(c, c) for c in cat_features]
+
         train_set = lgb.Dataset(
             X_train,
             label=y_train,
@@ -144,7 +203,7 @@ class LGBMModel(ModelBase):
         test_pred = booster.predict(X_test, num_iteration=booster.best_iteration)
         auc = float(roc_auc_score(y_valid, valid_pred))
 
-        # Persist booster
+        # Persist booster + the name mapping so feature-importance reports can recover originals.
         model_path = config.MODELS_DIR / f"{self.name}_fold{fold}.txt"
         booster.save_model(str(model_path), num_iteration=booster.best_iteration)
 
@@ -154,7 +213,7 @@ class LGBMModel(ModelBase):
             test_pred=np.asarray(test_pred),
             valid_auc=auc,
             n_iterations=booster.best_iteration or 0,
-            extra={"model_path": str(model_path)},
+            extra={"model_path": str(model_path), "name_map": name_map},
         )
         self.fold_artifacts.append(art)
         self.save_fold_predictions(art)

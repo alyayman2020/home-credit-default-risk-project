@@ -204,6 +204,12 @@ def compute_d1_neighbours(
     B = X_va[cols_present].fillna(medians).to_numpy(dtype=np.float32)
     C = X_test[cols_present].fillna(medians).to_numpy(dtype=np.float32)
 
+    # Defensive: if any inf snuck through (e.g. APP_CREDIT_TERM division by zero
+    # combined with median that was itself inf), replace with 0 in the fp32 view.
+    A[~np.isfinite(A)] = 0.0
+    B[~np.isfinite(B)] = 0.0
+    C[~np.isfinite(C)] = 0.0
+
     k_eff = min(k, len(A))
     nn = NearestNeighbors(n_neighbors=k_eff, algorithm="auto", n_jobs=-1)
     nn.fit(A)
@@ -238,6 +244,14 @@ def fit_rankgauss_per_fold(
     :data:`NAN_FLAG_SUFFIX` (``__isnan``) are left alone — they're already in {0, 1}.
     Integer-encoded categorical columns (suffix ``__nn``) are also left alone.
 
+    Inf sanitization
+    ----------------
+    Some engineered features (APP_CREDIT_TERM = AMT_ANNUITY/AMT_CREDIT,
+    PAYMENT_PERC = AMT_PAYMENT/AMT_INSTALMENT, etc.) can produce ``+inf``/``-inf``
+    when the denominator is zero. ``QuantileTransformer`` rejects these. We
+    replace ``inf``/``-inf`` with ``NaN`` before median-imputing — same treatment
+    as XGBoost's ``missing`` mechanism (PLAN §1.4 sentinel policy).
+
     Returns copies — does not mutate inputs.
     """
     X_tr = X_tr.copy()
@@ -254,6 +268,22 @@ def fit_rankgauss_per_fold(
     if not numeric_cols:
         return X_tr, X_va, X_test
 
+    # Step 1: Replace inf/-inf with NaN so median-impute and qt.fit don't choke.
+    # We only mutate the slices we'll feed to qt — leaves flag/encoded cat cols intact.
+    n_inf_total = 0
+    for col in numeric_cols:
+        for df in (X_tr, X_va, X_test):
+            arr = df[col].to_numpy()
+            inf_mask = np.isinf(arr)
+            if inf_mask.any():
+                n_inf_total += int(inf_mask.sum())
+                # Cast to float64 to allow NaN assignment without dtype surprises.
+                arr = arr.astype(np.float64, copy=True)
+                arr[inf_mask] = np.nan
+                df[col] = arr
+    if n_inf_total:
+        logger.info(f"  D2 RankGauss: replaced {n_inf_total} inf values with NaN before transform")
+
     qt = QuantileTransformer(
         n_quantiles=min(n_quantiles, len(X_tr)),
         output_distribution="normal",
@@ -261,6 +291,8 @@ def fit_rankgauss_per_fold(
     )
     # Median-impute before quantile transform (qt doesn't tolerate NaN).
     medians = X_tr[numeric_cols].median()
+    # Defensive: if a column is all-NaN on train fold, median is NaN — fall back to 0.
+    medians = medians.fillna(0.0)
     X_tr_filled = X_tr[numeric_cols].fillna(medians)
     X_va_filled = X_va[numeric_cols].fillna(medians)
     X_test_filled = X_test[numeric_cols].fillna(medians)
