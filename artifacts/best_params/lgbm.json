@@ -1,0 +1,19 @@
+{
+    "objective": "binary",
+    "metric": "auc",
+    "boosting_type": "gbdt",
+    "num_leaves": 57,
+    "learning_rate": 0.005,
+    "feature_fraction": 0.215,
+    "bagging_fraction": 0.984,
+    "bagging_freq": 1,
+    "min_child_samples": 158,
+    "reg_alpha": 0.018,
+    "reg_lambda": 0.002,
+    "max_depth": -1,
+    "n_estimators": 5000,
+    "verbose": -1,
+    "device_type": "cpu",
+    "scale_pos_weight": 11.4,
+    "seed": 42
+}
